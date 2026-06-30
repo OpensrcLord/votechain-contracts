@@ -1,6 +1,9 @@
 /**
  * Proposal routes with Redis caching applied.
  * On-chain data is fetched via the shared Stellar RPC service.
+ *
+ * Feature flags control which endpoints are active. Disabled features return
+ * a clear message indicating they are not available.
  */
 
 import { Router, Request, Response } from "express";
@@ -11,7 +14,7 @@ import {
   invalidateProposalCache,
 } from "../middleware/redisCache";
 import { validate } from "../middleware/requestValidator";
-import { sendSuccess } from "../middleware/response";
+import { sendSuccess, sendError } from "../middleware/response";
 import { requireAdmin } from "../middleware/adminAuth";
 import { logAdminAction, getAuditLog } from "../middleware/auditLogger";
 
@@ -63,6 +66,9 @@ router.post(
     },
   }),
   async (req: Request, res: Response) => {
+    if (!getFeatureFlags().enableProposalInvalidation) {
+      return sendError(res, 503, "FEATURE_DISABLED", DISABLED_FEATURE_MESSAGE);
+    }
     const { id } = req.body as { id?: string };
     logAdminAction({
       actor: "admin",
@@ -83,6 +89,9 @@ router.get("/audit-log", requireAdmin, (_req: Request, res: Response) => {
 
 // GET /metrics/cache — exposes hit/miss counters
 router.get("/metrics/cache", requireAdmin, (_req: Request, res: Response) => {
+  if (!getFeatureFlags().enableAdvancedMetrics) {
+    return sendError(res, 503, "FEATURE_DISABLED", DISABLED_FEATURE_MESSAGE);
+  }
   sendSuccess(res, getCacheMetrics());
 });
 
