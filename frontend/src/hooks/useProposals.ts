@@ -2,78 +2,109 @@
  * useProposals
  *
  * Fetches the proposal list from the backend / Soroban RPC and manages
- * loading / error state. The hook is intentionally thin so it can be
- * swapped out for a real Soroban SDK call without touching any UI component.
- *
- * Replace `fetchProposals()` below with your actual data-fetching logic
- * (e.g. reading from the Soroban contract via stellar-sdk or hitting the
- * backend /api/proposals endpoint).
+ * loading / error state. Uses the central proposal store for consistency.
+ * Preserves existing data on network errors for offline experience.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useCallback } from 'react';
 import { sampleProposals } from '../data';
 import type { Proposal } from '../types';
+import { useProposalStore } from '../store';
+import { api } from '../api/ApiClient';
 
-// ── Mock fetcher (replace with real implementation) ──────────────────────────
+const ENABLE_FOCUS_REFRESH = import.meta.env.VITE_ENABLE_FOCUS_REFRESH !== 'false';
+const FOCUS_REFRESH_DEBOUNCE_MS = parseNumberEnv('FOCUS_REFRESH_DEBOUNCE_MS', 3000);
 
-async function fetchProposals(): Promise<Proposal[]> {
-  // Simulate network latency so the skeleton loader is visible during dev.
-  // Remove the setTimeout in production and replace with the real call, e.g.:
-  //
-  //   const res = await fetch('/api/proposals');
-  //   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  //   return res.json() as Promise<Proposal[]>;
-  //
-  await new Promise<void>((resolve) => setTimeout(resolve, 1500));
-  return sampleProposals;
+function parseNumberEnv(key: string, fallback: number): number {
+  const raw = import.meta.env[`VITE_${key}`] as string | undefined;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-// ── Hook ─────────────────────────────────────────────────────────────────────
+// â”€â”€ Mock fetcher (replace with real implementation) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+async function fetchProposals(): Promise<Proposal[]> {
+  return api.get<Proposal[]>('/api/proposals');
+}
+
+// â”€â”€ Hook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 interface UseProposalsResult {
   proposals: Proposal[];
   loading: boolean;
   error: string | null;
+  lastFetch: number | null;
   /** Manually trigger a re-fetch (e.g. after submitting a new proposal). */
-  refresh: () => void;
+  refresh: () => Promise<void>;
 }
 
 export function useProposals(): UseProposalsResult {
-  const [proposals, setProposals] = useState<Proposal[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        const data = await fetchProposals();
-        if (!cancelled) setProposals(data);
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Failed to load proposals.');
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    load();
-
-    // Cleanup: ignore stale responses if the component unmounts mid-fetch
-    return () => {
-      cancelled = true;
-    };
-  }, [tick]);
-
-  return {
-    proposals,
+  const {
+    getAllProposals,
+    setProposals,
+    setLoading,
+    setError,
     loading,
     error,
-    refresh: () => setTick((t) => t + 1),
+    lastBlock,
+    lastFetch,
+  } = useProposalStore();
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchProposals();
+      const blockNumber = Date.now();
+      setProposals(data, blockNumber);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load proposals.');
+    } finally {
+      setLoading(false);
+    }
+  }, [setProposals, setLoading, setError]);
+
+  useEffect(() => {
+    if (lastBlock === 0) {
+      refresh();
+    }
+  }, [lastBlock, refresh]);
+
+  useEffect(() => {
+    if (!ENABLE_FOCUS_REFRESH || typeof window === 'undefined') return undefined;
+
+    let lastRefreshAt = 0;
+
+    const handleRefresh = () => {
+      const now = Date.now();
+      if (now - lastRefreshAt < FOCUS_REFRESH_DEBOUNCE_MS) {
+        return;
+      }
+
+      lastRefreshAt = now;
+      refresh();
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        handleRefresh();
+      }
+    };
+
+    window.addEventListener('focus', handleRefresh);
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('focus', handleRefresh);
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [refresh]);
+
+  return {
+    proposals: getAllProposals(),
+    loading,
+    error,
+    lastFetch,
+    refresh,
   };
 }
