@@ -3,7 +3,15 @@ target/
 .env.local
 .env.testnet
 .env.mainnet
+.env.integration
 *.wasm
+
+# Environment-specific secret files derived from deploy/*.env.example
+deploy/*.env
+
+# Coverage reports
+lcov.info
+coverage/
 
 # Node.js
 node_modules/
@@ -12,6 +20,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .eslintcache
+
+# Performance benchmark run output (committed baseline excluded)
+perf/api-results.json
 
 # Rust
 **/*.rs.bk

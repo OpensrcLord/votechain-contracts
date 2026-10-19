@@ -15,8 +15,6 @@
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Vec};
 use crate::{GovernanceContract, GovernanceContractClient};
 use crate::types::Vote;
-use crate::{GovernanceContract, GovernanceContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 /// Returned by [`setup_env`] — holds every handle needed by a test.
 pub struct TestEnv {
@@ -43,7 +41,18 @@ pub fn setup_env() -> TestEnv {
     let tok = votechain_token::TokenContractClient::new(&env, &tok_id);
     tok.initialize(&admin, &10_000_000);
 
-    client.initialize(&admin, &tok_id, &0_i128, &0_u64, &60_u64, &2_592_000_u64, &false, &0_u64, &0_u64);
+    client.initialize(
+        &admin,
+        &tok_id,
+        &0_i128,        // min_proposal_balance
+        &0_u64,         // proposal_cooldown
+        &60_u64,        // min_duration
+        &2_592_000_u64, // max_duration
+        &false,         // restrict_admin_vote
+        &0_u64,         // amend_window
+        &0_u64,         // timelock_duration
+        &0_i128,        // veto_threshold
+    );
 
     TestEnv {
         env,
@@ -72,4 +81,30 @@ pub fn mint_and_vote(t: &TestEnv, voter: &Address, proposal_id: u64, vote: Vote,
     let tok = votechain_token::TokenContractClient::new(&t.env, &t.token_id);
     tok.mint(&t.admin, voter, &amount);
     t.client.cast_vote(voter, &proposal_id, &vote);
+}
+
+/// Helper trait to add try_* methods to GovernanceContractClient for testing
+pub trait TryMethods {
+    fn try_execute(&self, admin: &Address, proposal_id: u64) -> Result<(), soroban_sdk::Error>;
+    fn try_cancel(&self, admin: &Address, proposal_id: u64) -> Result<(), soroban_sdk::Error>;
+    fn try_finalise(&self, proposal_id: u64) -> Result<(), soroban_sdk::Error>;
+    fn try_cast_vote(&self, voter: &Address, proposal_id: u64, vote: &Vote) -> Result<(), soroban_sdk::Error>;
+}
+
+impl TryMethods for GovernanceContractClient<'_> {
+    fn try_execute(&self, admin: &Address, proposal_id: u64) -> Result<(), soroban_sdk::Error> {
+        self.execute(admin, proposal_id)
+    }
+
+    fn try_cancel(&self, admin: &Address, proposal_id: u64) -> Result<(), soroban_sdk::Error> {
+        self.cancel(admin, proposal_id)
+    }
+
+    fn try_finalise(&self, proposal_id: u64) -> Result<(), soroban_sdk::Error> {
+        self.finalise(proposal_id)
+    }
+
+    fn try_cast_vote(&self, voter: &Address, proposal_id: u64, vote: &Vote) -> Result<(), soroban_sdk::Error> {
+        self.cast_vote(voter, proposal_id, vote)
+    }
 }
