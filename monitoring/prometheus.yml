@@ -1,0 +1,65 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  alerting:
+    alertmanagers:
+      - static_configs:
+          - targets:
+              - alertmanager:9093
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  # Prometheus itself
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Node Exporter
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Contract deployment metrics
+  - job_name: "votechain-contracts"
+    static_configs:
+      - targets: ["localhost:8000"]
+    metrics_path: "/metrics"
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Stellar RPC health
+  - job_name: "stellar-rpc"
+    static_configs:
+      - targets: ["stellar-rpc:11626"]
+    metrics_path: "/metrics"
+
+  # Stellar RPC HTTP endpoint (Soroban RPC)
+  - job_name: "stellar-rpc-http"
+    static_configs:
+      - targets: ["stellar-node:8000"]
+    metrics_path: "/soroban/rpc"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # Backend Express API
+  - job_name: "backend"
+    static_configs:
+      - targets: ["backend:3001"]
+    metrics_path: "/ready"
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Indexer service
+  - job_name: "indexer"
+    static_configs:
+      - targets: ["indexer:4000"]
+    metrics_path: "/events"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # PostgreSQL metrics (if available)
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
