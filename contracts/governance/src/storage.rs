@@ -38,8 +38,82 @@
 //! collide even when called with identical arguments.
 
 use soroban_sdk::{Env, Address, String};
-use crate::types::{ContractError, ContractState, DataKey, Proposal, VoteRecord};
-use soroban_sdk::{Address, Env};
+use crate::types::{ContractError, ContractState, DataKey, MultiSigAction, MultiSigConfig, Proposal, VoteRecord};
+
+// =============================================================================
+// SC-006: Storage TTL bump helpers
+// =============================================================================
+//
+// Soroban persistent entries expire after their TTL (measured in ledgers) hits
+// zero.  For long-lived proposals this means entries can silently disappear
+// mid-lifecycle.  We extend every persistent entry's TTL on every write, and
+// on every read that feeds a state-mutating operation.
+//
+// `LEDGERS_TO_LIVE` is the safe default (~31 days at 5 s/ledger).  Deployers
+// can override both threshold and target amount via `initialize`.
+
+/// Default TTL target and threshold when not explicitly configured (~31 days).
+pub const LEDGERS_TO_LIVE: u32 = 535_000;
+
+/// Reads the configured bump target (ledgers) from instance storage, falling
+/// back to [`LEDGERS_TO_LIVE`] when absent or zero.
+fn bump_amount(env: &Env) -> u32 {
+    let v: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::StorageBumpAmount)
+        .unwrap_or(0);
+    if v == 0 { LEDGERS_TO_LIVE } else { v }
+}
+
+/// Reads the configured bump threshold (ledgers) from instance storage,
+/// falling back to [`LEDGERS_TO_LIVE`] when absent or zero.
+fn bump_threshold(env: &Env) -> u32 {
+    let v: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::StorageBumpThreshold)
+        .unwrap_or(0);
+    if v == 0 { LEDGERS_TO_LIVE } else { v }
+}
+
+/// Extends the TTL of a persistent `key` only when its remaining TTL has
+/// fallen below the configured threshold.  This is a no-op when the entry
+/// is already long-lived enough, so calling it on every read/write is safe.
+#[inline]
+fn bump_persistent(env: &Env, key: &DataKey) {
+    let threshold = bump_threshold(env);
+    let amount = bump_amount(env);
+    env.storage().persistent().extend_ttl(key, threshold, amount);
+}
+
+// =============================================================================
+// SC-006: Accessors for the TTL configuration itself
+// =============================================================================
+
+/// Stores the bump target amount (ledger count) in instance storage.
+pub fn set_storage_bump_amount(env: &Env, amount: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StorageBumpAmount, &amount);
+}
+
+/// Returns the stored bump target amount. Falls back to [`LEDGERS_TO_LIVE`].
+pub fn get_storage_bump_amount(env: &Env) -> u32 {
+    bump_amount(env)
+}
+
+/// Stores the bump threshold (ledger count) in instance storage.
+pub fn set_storage_bump_threshold(env: &Env, threshold: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::StorageBumpThreshold, &threshold);
+}
+
+/// Returns the stored bump threshold. Falls back to [`LEDGERS_TO_LIVE`].
+pub fn get_storage_bump_threshold(env: &Env) -> u32 {
+    bump_threshold(env)
+}
 
 // =============================================================================
 // Storage Strategy
@@ -68,10 +142,8 @@ use soroban_sdk::{Address, Env};
 //                      is keyed by a variable (proposal ID, voter address, etc.).
 //
 //   DataKey::Proposal(id)                  – full proposal struct
-//   DataKey::HasVoted(proposal_id, voter)  – deduplication flag per voter
-//   DataKey::VoteRecord(proposal_id, voter)– immutable vote audit record
-//   DataKey::VoterSnapshot(proposal_id, voter) – balance snapshot at vote time
-//   DataKey::LastProposal(proposer)        – timestamp of proposer's last proposal
+//   DataKey::VoteRecord(proposal_id, voter) – vote type + weight snapshot (SC-013: replaces HasVoted + VoterSnapshot)
+//   DataKey::LastProposal(proposer)         – timestamp of proposer's last proposal
 //
 // TEMPORARY storage  – not used in this contract. Allowances in the token
 //                      contract use temporary storage; see token/src/storage.rs.
@@ -79,20 +151,29 @@ use soroban_sdk::{Address, Env};
 
 /// Persists a proposal to contract storage, keyed by its ID.
 /// TTL is automatically bumped to prevent expiry on long-running proposals.
+/// A compact [`ProposalMetadata`] summary is saved alongside for cost-efficient
+/// list-view reads (issue #485).
 pub fn save_proposal(env: &Env, p: &Proposal) {
     env.storage().persistent().set(&DataKey::Proposal(p.id), p);
     bump_proposal_ttl(env, p.id);
+    save_metadata_summary(env, p);
 }
 
 /// Loads a proposal from storage by ID.
+/// SC-006: TTL is bumped on every successful read that feeds a state-mutating
+/// operation, preventing expiry between a vote and a subsequent finalise call.
 ///
 /// # Errors
-/// - [`ContractError::ProposalNotFound`] if no proposal exists for `id`.
+/// - [`ContractError::NotFound`] if no proposal exists for `id`.
 pub fn load_proposal(env: &Env, id: u64) -> Result<Proposal, ContractError> {
-    env.storage()
+    let key = DataKey::Proposal(id);
+    let proposal = env
+        .storage()
         .persistent()
-        .get(&DataKey::Proposal(id))
-        .ok_or(ContractError::ProposalNotFound)
+        .get(&key)
+        .ok_or(ContractError::NotFound)?;
+    bump_persistent(env, &key);
+    Ok(proposal)
 }
 
 /// Increments the proposal counter and returns the new ID.
@@ -103,7 +184,7 @@ pub fn load_proposal(env: &Env, id: u64) -> Result<Proposal, ContractError> {
 /// transactions in the same ledger) each observe a unique counter value.
 ///
 /// # Errors
-/// - [`ContractError::ProposalCountOverflow`] if the counter would exceed `u64::MAX`.
+/// - [`ContractError::IdOverflow`] if the counter would exceed `u64::MAX`.
 pub fn next_id(env: &Env) -> Result<u64, ContractError> {
     let current: u64 = env
         .storage()
@@ -112,7 +193,7 @@ pub fn next_id(env: &Env) -> Result<u64, ContractError> {
         .unwrap_or(0);
     let n = current
         .checked_add(1)
-        .ok_or(ContractError::ProposalCountOverflow)?;
+        .ok_or(ContractError::IdOverflow)?;
     env.storage().instance().set(&DataKey::ProposalCount, &n);
     Ok(n)
 }
@@ -162,12 +243,12 @@ pub fn set_voting_token(env: &Env, token: &Address) {
 /// Returns the stored governance token address.
 ///
 /// # Errors
-/// - [`ContractError::VotingTokenNotSet`] if the contract has not been initialised.
+/// - [`ContractError::TokenNotSet`] if the contract has not been initialised.
 pub fn get_voting_token(env: &Env) -> Result<Address, ContractError> {
     env.storage()
         .instance()
         .get(&DataKey::VotingToken)
-        .ok_or(ContractError::VotingTokenNotSet)
+        .ok_or(ContractError::TokenNotSet)
 }
 
 pub fn set_veto_threshold(env: &Env, v: i128) {
@@ -178,26 +259,35 @@ pub fn get_veto_threshold(env: &Env) -> i128 {
     env.storage().instance().get(&DataKey::VetoThreshold).unwrap_or(0)
 }
 
-/// Records that `voter` has voted on `proposal_id`.
-/// TTL is automatically bumped to prevent expiry on long-running proposals.
-pub fn mark_voted(env: &Env, proposal_id: u64, voter: &Address) {
-    env.storage().persistent().set(&DataKey::HasVoted(proposal_id, voter.clone()), &true);
-    bump_has_voted_ttl(env, proposal_id, voter);
-}
+// =============================================================================
+// SC-013: Per-voter-per-proposal storage — single VoteRecord key
+//
+// Before: HasVoted(id,voter), VoteRecord(id,voter), VoterSnapshot(id,voter) = 3 writes
+// After:  VoteRecord(id,voter) only = 1 write
+// Savings per vote: 2 persistent writes, 2 TTL extend_ttl calls, 2 key encodings.
+// =============================================================================
 
 /// Returns `true` if `voter` has already voted on `proposal_id`.
+/// SC-013: checks VoteRecord key existence — no separate HasVoted key.
 pub fn has_voted(env: &Env, proposal_id: u64, voter: &Address) -> bool {
     env.storage()
         .persistent()
-        .get(&DataKey::HasVoted(proposal_id, voter.clone()))
-        .unwrap_or(false)
+        .has(&DataKey::VoteRecord(proposal_id, voter.clone()))
 }
 
-/// Stores the vote record for `voter` on `proposal_id`.
-/// TTL is automatically bumped to prevent expiry on long-running proposals.
+/// Stores the vote record (type + weight) for `voter` on `proposal_id`.
+/// SC-013: replaces mark_voted + save_voter_snapshot + save_vote_record.
 pub fn save_vote_record(env: &Env, proposal_id: u64, voter: &Address, record: &VoteRecord) {
-    env.storage().persistent().set(&DataKey::VoteRecord(proposal_id, voter.clone()), record);
+    let key = DataKey::VoteRecord(proposal_id, voter.clone());
+    env.storage().persistent().set(&key, record);
     bump_vote_record_ttl(env, proposal_id, voter);
+}
+
+/// Removes the vote record. Used to roll back the reentrancy sentinel on error.
+pub fn remove_vote_record(env: &Env, proposal_id: u64, voter: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::VoteRecord(proposal_id, voter.clone()));
 }
 
 /// Returns the vote record for `voter` on `proposal_id`, or `None` if not voted.
@@ -243,23 +333,52 @@ pub fn get_last_proposal(env: &Env, proposer: &Address) -> u64 {
         .unwrap_or(0)
 }
 
-/// Records the voter's token balance snapshot for a given proposal.
-/// Called once per voter per proposal at the time of casting their vote.
-/// TTL is automatically bumped to prevent expiry on long-running proposals.
-pub fn save_voter_snapshot(env: &Env, proposal_id: u64, voter: &Address, weight: i128) {
+// =============================================================================
+// Vote delegation storage
+// =============================================================================
+
+/// Stores the delegatee for `delegator`.
+pub fn set_delegation(env: &Env, delegator: &Address, delegatee: &Address) {
     env.storage()
         .persistent()
-        .set(&DataKey::VoterSnapshot(proposal_id, voter.clone()), &weight);
-    bump_voter_snapshot_ttl(env, proposal_id, voter);
+        .set(&DataKey::Delegation(delegator.clone()), delegatee);
 }
 
-/// Returns the stored vote-weight snapshot for a voter on a proposal.
-/// Returns `None` if no snapshot has been recorded yet.
-pub fn get_voter_snapshot(env: &Env, proposal_id: u64, voter: &Address) -> Option<i128> {
+/// Returns the delegatee for `delegator`, if any.
+pub fn get_delegatee(env: &Env, delegator: &Address) -> Option<Address> {
     env.storage()
         .persistent()
-        .get(&DataKey::VoterSnapshot(proposal_id, voter.clone()))
+        .get(&DataKey::Delegation(delegator.clone()))
 }
+
+/// Clears the delegation record for `delegator`.
+pub fn clear_delegation(env: &Env, delegator: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Delegation(delegator.clone()));
+}
+
+/// Stores the aggregate delegated weight received by `delegatee`.
+pub fn set_delegated_weight(env: &Env, delegatee: &Address, weight: i128) {
+    if weight == 0 {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DelegatedWeight(delegatee.clone()));
+    } else {
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegatedWeight(delegatee.clone()), &weight);
+    }
+}
+
+/// Returns the aggregate delegated weight for `delegatee` (0 if none).
+pub fn get_delegated_weight(env: &Env, delegatee: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DelegatedWeight(delegatee.clone()))
+        .unwrap_or(0)
+}
+
 /// Stores the contract version as a `(major, minor, patch)` tuple.
 pub fn set_version(env: &Env, version: (u32, u32, u32)) {
     env.storage().instance().set(&DataKey::Version, &version);
@@ -400,7 +519,7 @@ pub fn get_multisig_config(env: &Env) -> Option<MultiSigConfig> {
 /// Increments the multi-sig action counter and returns the new ID.
 ///
 /// # Errors
-/// - [`ContractError::ProposalCountOverflow`] if the counter would exceed `u64::MAX`.
+/// - [`ContractError::IdOverflow`] if the counter would exceed `u64::MAX`.
 pub fn next_multisig_action_id(env: &Env) -> Result<u64, ContractError> {
     let current: u64 = env
         .storage()
@@ -409,7 +528,7 @@ pub fn next_multisig_action_id(env: &Env) -> Result<u64, ContractError> {
         .unwrap_or(0);
     let n = current
         .checked_add(1)
-        .ok_or(ContractError::ProposalCountOverflow)?;
+        .ok_or(ContractError::IdOverflow)?;
     env.storage().instance().set(&DataKey::MultiSigActionCount, &n);
     Ok(n)
 }
@@ -424,14 +543,19 @@ pub fn save_multisig_action(env: &Env, action: &MultiSigAction) {
 }
 
 /// Loads a multi-sig action by ID.
+/// SC-006: TTL bumped on successful read (feeds state-mutating approve path).
 ///
 /// # Errors
-/// - [`ContractError::ActionNotFound`] if no action exists for `id`.
+/// - [`ContractError::NoAction`] if no action exists for `id`.
 pub fn load_multisig_action(env: &Env, id: u64) -> Result<MultiSigAction, ContractError> {
-    env.storage()
+    let key = DataKey::MultiSigAction(id);
+    let action = env
+        .storage()
         .persistent()
-        .get(&DataKey::MultiSigAction(id))
-        .ok_or(ContractError::ActionNotFound)
+        .get(&key)
+        .ok_or(ContractError::NoAction)?;
+    bump_persistent(env, &key);
+    Ok(action)
 }
 
 /// Records that `approver` has approved multi-sig action `action_id`.
@@ -479,7 +603,7 @@ pub fn bump_proposal_ttl(env: &Env, proposal_id: u64) {
     let ttl = get_persistent_storage_ttl(env);
     env.storage()
         .persistent()
-        .bump(&DataKey::Proposal(proposal_id), ttl);
+        .extend_ttl(&DataKey::Proposal(proposal_id), ttl, ttl);
 }
 
 /// Bumps the TTL of a vote record entry.
@@ -487,23 +611,7 @@ pub fn bump_vote_record_ttl(env: &Env, proposal_id: u64, voter: &Address) {
     let ttl = get_persistent_storage_ttl(env);
     env.storage()
         .persistent()
-        .bump(&DataKey::VoteRecord(proposal_id, voter.clone()), ttl);
-}
-
-/// Bumps the TTL of a HasVoted flag entry.
-pub fn bump_has_voted_ttl(env: &Env, proposal_id: u64, voter: &Address) {
-    let ttl = get_persistent_storage_ttl(env);
-    env.storage()
-        .persistent()
-        .bump(&DataKey::HasVoted(proposal_id, voter.clone()), ttl);
-}
-
-/// Bumps the TTL of a voter snapshot entry.
-pub fn bump_voter_snapshot_ttl(env: &Env, proposal_id: u64, voter: &Address) {
-    let ttl = get_persistent_storage_ttl(env);
-    env.storage()
-        .persistent()
-        .bump(&DataKey::VoterSnapshot(proposal_id, voter.clone()), ttl);
+        .extend_ttl(&DataKey::VoteRecord(proposal_id, voter.clone()), ttl, ttl);
 }
 
 /// Bumps the TTL of a LastProposal entry.
@@ -511,7 +619,7 @@ pub fn bump_last_proposal_ttl(env: &Env, proposer: &Address) {
     let ttl = get_persistent_storage_ttl(env);
     env.storage()
         .persistent()
-        .bump(&DataKey::LastProposal(proposer.clone()), ttl);
+        .extend_ttl(&DataKey::LastProposal(proposer.clone()), ttl, ttl);
 }
 
 /// Bumps the TTL of a multi-sig action entry.
@@ -519,7 +627,7 @@ pub fn bump_multisig_action_ttl(env: &Env, action_id: u64) {
     let ttl = get_persistent_storage_ttl(env);
     env.storage()
         .persistent()
-        .bump(&DataKey::MultiSigAction(action_id), ttl);
+        .extend_ttl(&DataKey::MultiSigAction(action_id), ttl, ttl);
 }
 
 /// Bumps the TTL of a multi-sig approval entry.
@@ -527,5 +635,83 @@ pub fn bump_multisig_approval_ttl(env: &Env, action_id: u64, approver: &Address)
     let ttl = get_persistent_storage_ttl(env);
     env.storage()
         .persistent()
-        .bump(&DataKey::MultiSigApproval(action_id, approver.clone()), ttl);
+        .extend_ttl(&DataKey::MultiSigApproval(action_id, approver.clone()), ttl, ttl);
+}
+
+// =============================================================================
+// Metadata version storage (#547)
+// =============================================================================
+
+/// Stores the current metadata schema version for newly created proposals.
+/// Bumped by `migrate()` when the proposal data format evolves.
+pub fn set_metadata_version(env: &Env, v: u32) {
+    env.storage().instance().set(&DataKey::MetadataVersion, &v);
+}
+
+/// Returns the stored metadata version, defaulting to 1 (initial schema).
+pub fn get_metadata_version(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MetadataVersion)
+        .unwrap_or(1)
+}
+
+// =============================================================================
+// Default quorum storage
+// =============================================================================
+
+/// Stores the default quorum hint in instance storage.
+pub fn set_quorum_default(env: &Env, v: i128) {
+    env.storage().instance().set(&DataKey::QuorumDefault, &v);
+}
+
+/// Returns the default quorum hint, or 0 if not set.
+pub fn get_quorum_default(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::QuorumDefault)
+        .unwrap_or(0)
+}
+
+// =============================================================================
+// Metadata summary storage (issue #485)
+// =============================================================================
+
+use crate::types::ProposalMetadata;
+
+/// Computes a simple FNV-1a checksum over bytes.
+fn fnv1a(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in data {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// Saves a compact metadata summary alongside a proposal.
+pub fn save_metadata_summary(env: &Env, p: &crate::types::Proposal) {
+    let desc_len = p.description.len();
+    let preview_len = if desc_len > 256 { 256 } else { desc_len } as usize;
+    let mut buf = [0u8; 1024];
+    let full_len = desc_len as usize;
+    p.description.copy_into_slice(&mut buf[..full_len]);
+    let checksum = fnv1a(&buf[..full_len]);
+    let preview = String::from_str(env, &core::str::from_utf8(&buf[..preview_len]).unwrap_or(""));
+    let meta = ProposalMetadata {
+        title: p.title.clone(),
+        description_preview: preview,
+        description_checksum: checksum,
+        description_len: desc_len,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::MetadataSummary(p.id), &meta);
+}
+
+/// Loads a metadata summary for a proposal.
+pub fn load_metadata_summary(env: &Env, proposal_id: u64) -> Option<ProposalMetadata> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MetadataSummary(proposal_id))
 }
